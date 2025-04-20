@@ -130,20 +130,89 @@ export async function onRequestPost(context) {  // Contents of context object
     // img_url 未定义或为空的处理逻辑
     if (typeof env.img_url == "undefined" || env.img_url == null || env.img_url == "") {
         return new Response('Error: Please configure KV database', { status: 500 });
-    } 
-
-    // 获取文件信息
-    const time = new Date().getTime();
-    const formdata = await clonedRequest.formData();
-    const fileType = formdata.get('file').type;
-    let fileName = formdata.get('file').name;
-    const fileSize = (formdata.get('file').size / 1024 / 1024).toFixed(2); // 文件大小，单位MB
-    // 检查fileType和fileName是否存在
-    if (fileType === null || fileType === undefined || fileName === null || fileName === undefined) {
-        return new Response('Error: fileType or fileName is wrong, check the integrity of this file!', { status: 400 });
     }
 
-    fileName = fileName.split('/').pop();
+    // 获取文件信息 或 处理 fetch action
+    const time = new Date().getTime();
+    const formdata = await clonedRequest.formData();
+    let fileToUpload;
+    let fileType;
+    let fileName;
+    let fileSize; // 文件大小，单位MB
+
+    const action = url.searchParams.get('action');
+
+    if (action === 'fetch') {
+        const targetUrl = formdata.get('url');
+        if (!targetUrl) {
+            return new Response('Error: URL is required for fetch action', { status: 400 });
+        }
+        try {
+            const response = await fetch(targetUrl);
+            if (!response.ok) {
+                throw new Error(`Failed to fetch URL: ${response.statusText}`);
+            }
+            const fetchedContentType = response.headers.get('content-type') || 'application/octet-stream';
+            // 基础的文件名提取，可能需要更健壮的逻辑
+            let fetchedFileName = targetUrl.substring(targetUrl.lastIndexOf('/') + 1).split(/[?#]/)[0];
+            if (!fetchedFileName) { // 如果URL以/结尾或没有路径部分
+                 // 尝试从 Content-Disposition 获取文件名
+                 const disposition = response.headers.get('content-disposition');
+                 const filenameMatch = disposition && disposition.match(/filename\*?=['"]?([^'";]+)['"]?/);
+                 if (filenameMatch && filenameMatch[1]) {
+                     fetchedFileName = decodeURIComponent(filenameMatch[1]);
+                 } else {
+                     fetchedFileName = `fetched_${time}`; // 备用名称
+                 }
+            }
+
+            const fileContent = await response.blob();
+
+            // 创建一个类似 File 的对象，因为后续代码可能依赖这些属性
+            fileToUpload = fileContent; // 直接使用 Blob
+            // 显式添加 name 属性，因为 Blob 本身没有
+            Object.defineProperty(fileToUpload, 'name', {
+                value: fetchedFileName,
+                writable: true, // 如果需要后续修改
+            });
+            // fileToUpload.size 在 Blob 上已存在
+            // fileToUpload.type 在 Blob 上已存在
+
+            fileType = fileToUpload.type;
+            fileName = fileToUpload.name;
+            fileSize = (fileToUpload.size / 1024 / 1024).toFixed(2);
+
+        } catch (error) {
+            console.error('Fetch action error:', error);
+            return new Response(`Error fetching URL: ${error.message}`, { status: 500 });
+        }
+
+    } else if (uploadChannel === 'External') {
+        // 对于 External 渠道，我们不需要实际的文件内容，但需要设置一些元数据
+        fileName = formdata.get('url') || `external_${time}`; // 使用 URL 或备用名
+        fileType = 'external/link'; // 虚拟类型
+        fileSize = 0;
+        fileToUpload = null; // 标记没有实际文件
+         // 检查 URL 是否存在
+        if (!formdata.get('url')) {
+            return new Response('Error: URL is required for external channel', { status: 400 });
+        }
+    }
+    else {
+        fileToUpload = formdata.get('file');
+        if (!fileToUpload) {
+             return new Response('Error: No file provided in form data', { status: 400 });
+        }
+        fileType = fileToUpload.type;
+        fileName = fileToUpload.name;
+        fileSize = (fileToUpload.size / 1024 / 1024).toFixed(2);
+        // 检查fileType和fileName是否存在
+        if (fileType === null || fileType === undefined || fileName === null || fileName === undefined) {
+            return new Response('Error: fileType or fileName is wrong, check the integrity of this file!', { status: 400 });
+        }
+        // 从完整路径中提取文件名
+        fileName = fileName.includes('/') ? fileName.substring(fileName.lastIndexOf('/') + 1) : fileName;
+    }
     // 如果上传文件夹路径为空，尝试从文件名中获取
     if (uploadFolder === '' || uploadFolder === null || uploadFolder === undefined) {
         uploadFolder = fileName.split('/').slice(0, -1).join('/');
@@ -222,7 +291,7 @@ export async function onRequestPost(context) {  // Contents of context object
     // 上传到不同渠道
     if (uploadChannel === 'CloudflareR2') {
         // -------------CloudFlare R2 渠道---------------
-        const res = await uploadFileToCloudflareR2(env, formdata, fullId, metadata, returnLink, url);
+        const res = await uploadFileToCloudflareR2(env, fileToUpload, fullId, metadata, returnLink, url); // 使用 fileToUpload
         if (res.status === 200 || !autoRetry) {
             return res;
         } else {
@@ -230,7 +299,7 @@ export async function onRequestPost(context) {  // Contents of context object
         }
     } else if (uploadChannel === 'S3') {
         // ---------------------S3 渠道------------------
-        const res = await uploadFileToS3(env, formdata, fullId, metadata, returnLink, url);
+        const res = await uploadFileToS3(env, fileToUpload, fullId, metadata, returnLink, url); // 使用 fileToUpload
         if (res.status === 200 || !autoRetry) {
             return res;
         } else {
@@ -238,11 +307,13 @@ export async function onRequestPost(context) {  // Contents of context object
         }
     } else if (uploadChannel === 'External') {
         // --------------------外链渠道----------------------
-        const res = await uploadFileToExternal(env, formdata, fullId, metadata, returnLink, url);
-        return res;
+        // 注意：External 渠道的逻辑已在文件获取部分处理，这里直接调用函数记录元数据
+        // 它不涉及实际文件上传，所以不传递 fileToUpload
+        const res = await uploadFileToExternal(env, formdata.get('url'), fullId, metadata, returnLink, url); // 传递提取的 URL
+        return res; // External 渠道不参与重试
     } else {
         // ----------------Telegram New 渠道-------------------
-        const res = await uploadFileToTelegram(env, formdata, fullId, metadata, fileExt, fileName, fileType, url, clonedRequest, returnLink);
+        const res = await uploadFileToTelegram(env, fileToUpload, fullId, metadata, fileExt, fileName, fileType, url, clonedRequest, returnLink); // 使用 fileToUpload
         if (res.status === 200 || !autoRetry) {
             return res;
         } else {
@@ -250,44 +321,65 @@ export async function onRequestPost(context) {  // Contents of context object
         }
     }
 
-    // 上传失败，开始自动切换渠道重试
-    const res = await tryRetry(err, env, uploadChannel, formdata, fullId, metadata, fileExt, fileName, fileType, url, clonedRequest, returnLink);
+    // 上传失败，开始自动切换渠道重试 (External 渠道不参与)
+    const res = await tryRetry(err, env, uploadChannel, fileToUpload, fullId, metadata, fileExt, fileName, fileType, url, clonedRequest, returnLink); // 使用 fileToUpload
     return res;
 }
 
 
 // 自动切换渠道重试
-async function tryRetry(err, env, uploadChannel, formdata, fullId, metadata, fileExt, fileName, fileType, url, clonedRequest, returnLink) {
-    // 渠道列表
+async function tryRetry(err, env, uploadChannel, fileToUpload, fullId, metadata, fileExt, fileName, fileType, url, clonedRequest, returnLink) { // 接收 fileToUpload
+    // 渠道列表 (不包括 External)
     const channelList = ['CloudflareR2', 'TelegramNew', 'S3'];
     const errMessages = {};
     errMessages[uploadChannel] = 'Error: ' + uploadChannel + err;
     for (let i = 0; i < channelList.length; i++) {
-        if (channelList[i] !== uploadChannel) {
-            let res = null;
-            if (channelList[i] === 'CloudflareR2') {
-                res = await uploadFileToCloudflareR2(env, formdata, fullId, metadata, returnLink, url);
-            } else if (channelList[i] === 'TelegramNew') {
-                res = await uploadFileToTelegram(env, formdata, fullId, metadata, fileExt, fileName, fileType, url, clonedRequest, returnLink);
-            } else if (channelList[i] === 'S3') {
-                res = await uploadFileToS3(env, formdata, fullId, metadata, returnLink, url);
-            }
+        // 跳过初始失败的渠道和 External 渠道
+        if (channelList[i] === uploadChannel || channelList[i] === 'External') {
+            continue;
+        }
 
-            if (res.status === 200) {
+        let res = null;
+        try {
+            if (channelList[i] === 'CloudflareR2') {
+                res = await uploadFileToCloudflareR2(env, fileToUpload, fullId, metadata, returnLink, url); // 使用 fileToUpload
+            } else if (channelList[i] === 'TelegramNew') {
+                res = await uploadFileToTelegram(env, fileToUpload, fullId, metadata, fileExt, fileName, fileType, url, clonedRequest, returnLink); // 使用 fileToUpload
+            } else if (channelList[i] === 'S3') {
+                res = await uploadFileToS3(env, fileToUpload, fullId, metadata, returnLink, url); // 使用 fileToUpload
+            }
+        } catch (retryError) {
+             // 捕获重试过程中的异常
+             errMessages[channelList[i]] = `Error: ${channelList[i]} - ${retryError.message}`;
+             continue; // 继续尝试下一个渠道
+        }
+
+
+        if (res && res.status === 200) { // 检查 res 是否存在且成功
                 return res;
             } else {
-                errMessages[channelList[i]] = 'Error: ' + channelList[i] + await res.text();
+                // 添加检查以确保 res 存在
+                let errorText = 'Upload failed or caught error';
+                if (res) {
+                    try {
+                        errorText = await res.text();
+                    } catch (e) {
+
+                        // Handle cases where reading the response body fails
+                        errorText = `Failed to read response text: ${e.message}`;
+                    }
+                }
+                errMessages[channelList[i]] = 'Error: ' + channelList[i] + ': ' + errorText; // Added colon for clarity
             }
-        }
-    }
+        } // Closes the for loop
 
     return new Response(JSON.stringify(errMessages), { status: 500 });
 }
 
-
 // 上传到Cloudflare R2
-async function uploadFileToCloudflareR2(env, formdata, fullId, metadata, returnLink, originUrl) {
+async function uploadFileToCloudflareR2(env, fileToUpload, fullId, metadata, returnLink, originUrl) { // 修改参数为 fileToUpload
     // 检查R2数据库是否配置
+    if (!fileToUpload) return new Response('Error: No file content to upload to R2', { status: 400 }); // 添加检查
     if (typeof env.img_r2 == "undefined" || env.img_r2 == null || env.img_r2 == "") {
         return new Response('Error: Please configure R2 database', { status: 500 });
     }
@@ -302,7 +394,9 @@ async function uploadFileToCloudflareR2(env, formdata, fullId, metadata, returnL
     const R2DataBase = env.img_r2;
 
     // 写入R2数据库
-    await R2DataBase.put(fullId, formdata.get('file'));
+    await R2DataBase.put(fullId, fileToUpload, { // 使用 fileToUpload
+        httpMetadata: { contentType: fileToUpload.type }, // 显式设置 ContentType
+    });
 
     // 更新metadata
     metadata.Channel = "CloudflareR2";
@@ -336,7 +430,8 @@ async function uploadFileToCloudflareR2(env, formdata, fullId, metadata, returnL
 
 
 // 上传到 S3（支持自定义端点）
-async function uploadFileToS3(env, formdata, fullId, metadata, returnLink, originUrl) {
+async function uploadFileToS3(env, fileToUpload, fullId, metadata, returnLink, originUrl) { // 修改参数为 fileToUpload
+    if (!fileToUpload) return new Response('Error: No file content to upload to S3', { status: 400 }); // 添加检查
     const s3Settings = uploadConfig.s3;
     const s3Channels = s3Settings.channels;
     const s3Channel = s3Settings.loadBalance.enabled
@@ -359,13 +454,12 @@ async function uploadFileToS3(env, formdata, fullId, metadata, returnLink, origi
         }
     });
 
-    // 获取文件
-    const file = formdata.get("file");
-    if (!file) return new Response("Error: No file provided", { status: 400 });
+    // 获取文件内容 (已经是 Blob 或 File)
+    if (!fileToUpload) return new Response("Error: No file provided", { status: 400 }); // 重复检查以防万一
 
-    // 转换 Blob 为 Uint8Array
-    const arrayBuffer = await file.arrayBuffer();
-    const uint8Array = new Uint8Array(arrayBuffer);
+    // 转换 Blob/File 为 ArrayBuffer (S3 SDK 需要)
+    const arrayBuffer = await fileToUpload.arrayBuffer();
+    // const uint8Array = new Uint8Array(arrayBuffer); // SDK v3 putObjectCommand可以直接接受ArrayBuffer
 
     const s3FileName = fullId;
 
@@ -374,8 +468,8 @@ async function uploadFileToS3(env, formdata, fullId, metadata, returnLink, origi
         const putObjectParams = {
             Bucket: bucketName,
             Key: s3FileName,
-            Body: uint8Array, // 直接使用 Blob
-            ContentType: file.type
+            Body: arrayBuffer, // 使用 ArrayBuffer
+            ContentType: fileToUpload.type // 使用传入对象的类型
         };
 
         // 执行上传
@@ -424,7 +518,8 @@ async function uploadFileToS3(env, formdata, fullId, metadata, returnLink, origi
 }
 
 // 上传到Telegram
-async function uploadFileToTelegram(env, formdata, fullId, metadata, fileExt, fileName, fileType, url, clonedRequest, returnLink) {
+async function uploadFileToTelegram(env, fileToUpload, fullId, metadata, fileExt, fileName, fileType, url, clonedRequest, returnLink) { // 修改参数为 fileToUpload
+    if (!fileToUpload) return new Response('Error: No file content to upload to Telegram', { status: 400 }); // 添加检查
     // 选择一个 Telegram 渠道上传，若负载均衡开启，则随机选择一个；否则选择第一个
     const tgSettings = uploadConfig.telegram;
     const tgChannels = tgSettings.channels;
@@ -436,15 +531,17 @@ async function uploadFileToTelegram(env, formdata, fullId, metadata, fileExt, fi
     const tgBotToken = tgChannel.botToken;
     const tgChatId = tgChannel.chatId;
 
-    // 由于TG会把gif后缀的文件转为视频，所以需要修改后缀名绕过限制
+    let fileToSend = fileToUpload; // 默认使用传入的文件
+
+    // 由于TG会把gif/webp后缀的文件转为视频，所以需要修改后缀名绕过限制
+    // 注意：这里创建了新的 File 对象，需要确保后续使用这个 newFile
     if (fileExt === 'gif') {
         const newFileName = fileName.replace(/\.gif$/, '.jpeg');
-        const newFile = new File([formdata.get('file')], newFileName, { type: fileType });
-        formdata.set('file', newFile);
+        // 从原始 fileToUpload 创建新 File，而不是 formdata.get('file')
+        fileToSend = new File([await fileToUpload.arrayBuffer()], newFileName, { type: 'image/jpeg' }); // 使用修改后的类型
     } else if (fileExt === 'webp') {
         const newFileName = fileName.replace(/\.webp$/, '.jpeg');
-        const newFile = new File([formdata.get('file')], newFileName, { type: fileType });
-        formdata.set('file', newFile);
+        fileToSend = new File([await fileToUpload.arrayBuffer()], newFileName, { type: 'image/jpeg' }); // 使用修改后的类型
     }
 
     // 选择对应的发送接口
@@ -474,9 +571,8 @@ async function uploadFileToTelegram(env, formdata, fullId, metadata, fileExt, fi
     // 根据发送接口向表单嵌入chat_id
     let newFormdata = new FormData();
     newFormdata.append('chat_id', tgChatId);
-    newFormdata.append(sendFunction.type, formdata.get('file'));
+    newFormdata.append(sendFunction.type, fileToSend, fileToSend.name); // 使用处理后的 fileToSend，并传递文件名
 
-    
     // 构建目标 URL 
     // const targetUrl = new URL(url.pathname, 'https://telegra.ph'); // telegraph接口，已失效，缅怀
     const targetUrl = new URL(`https://api.telegram.org/bot${tgBotToken}/${sendFunction.url}`); // telegram接口
@@ -547,14 +643,13 @@ async function uploadFileToTelegram(env, formdata, fullId, metadata, fileExt, fi
 
 
 // 外链渠道
-async function uploadFileToExternal(env, formdata, fullId, metadata, returnLink, originUrl) {
+async function uploadFileToExternal(env, extUrl, fullId, metadata, returnLink, originUrl) { // 接收 extUrl 而不是 formdata
     // 直接将外链写入metadata
     metadata.Channel = "External";
     metadata.ChannelName = "External";
-    // 从 formdata 中获取外链
-    const extUrl = formdata.get('url');
-    if (extUrl === null || extUrl === undefined) {
-        return new Response('Error: No url provided', { status: 400 });
+    // 外链已作为参数传入
+    if (extUrl === null || extUrl === undefined || extUrl.trim() === '') {
+        return new Response('Error: No url provided for external channel', { status: 400 });
     }
     metadata.ExternalLink = extUrl;
     // 写入KV数据库
