@@ -322,58 +322,83 @@ export async function onRequestPost(context) {  // Contents of context object
     }
 
     // 上传失败，开始自动切换渠道重试 (External 渠道不参与)
-    const res = await tryRetry(err, env, uploadChannel, fileToUpload, fullId, metadata, fileExt, fileName, fileType, url, clonedRequest, returnLink); // 使用 fileToUpload
-    return res;
+    // 构造更详细的初始错误信息
+    const initialErrorDetails = {
+        channel: uploadChannel,
+        message: err || 'Initial upload failed without specific error text.', // 使用 err 或默认消息
+        status: res?.status, // 包含状态码（如果可用）
+    };
+    const retryResult = await tryRetry(initialErrorDetails, env, uploadChannel, fileToUpload, fullId, metadata, fileExt, fileName, fileType, url, clonedRequest, returnLink); // 传递详细错误对象, uploadChannel, 和 fileToUpload
+    return retryResult;
 }
 
 
-// 自动切换渠道重试
-async function tryRetry(err, env, uploadChannel, fileToUpload, fullId, metadata, fileExt, fileName, fileType, url, clonedRequest, returnLink) { // 接收 fileToUpload
-    // 渠道列表 (不包括 External)
-    const channelList = ['CloudflareR2', 'TelegramNew', 'S3'];
-    const errMessages = {};
-    errMessages[uploadChannel] = 'Error: ' + uploadChannel + err;
-    for (let i = 0; i < channelList.length; i++) {
-        // 跳过初始失败的渠道和 External 渠道
-        if (channelList[i] === uploadChannel || channelList[i] === 'External') {
+// 自动切换渠道重试 (重构以改进错误处理和日志记录)
+async function tryRetry(initialErrorDetails, env, initialUploadChannel, fileToUpload, fullId, metadata, fileExt, fileName, fileType, url, clonedRequest, returnLink) {
+    const retryChannels = ['CloudflareR2', 'TelegramNew', 'S3']; // 渠道列表 (不包括 External)
+    const allErrors = {}; // 用于收集所有尝试的错误
+
+    // 记录初始错误 - 使用传入的 initialErrorDetails 对象
+    allErrors[initialUploadChannel] = `Initial attempt failed: ${initialErrorDetails.message} (Status: ${initialErrorDetails.status || 'N/A'})`;
+
+    for (const channel of retryChannels) {
+        // 跳过初始失败的渠道和 External 渠道 (External 不参与重试)
+        if (channel === initialUploadChannel || channel === 'External') {
             continue;
         }
 
-        let res = null;
+        console.log(`Retrying upload with channel: ${channel}`); // 添加日志
+        let retryResponse = null;
+        let attemptError = null;
+
         try {
-            if (channelList[i] === 'CloudflareR2') {
-                res = await uploadFileToCloudflareR2(env, fileToUpload, fullId, metadata, returnLink, url); // 使用 fileToUpload
-            } else if (channelList[i] === 'TelegramNew') {
-                res = await uploadFileToTelegram(env, fileToUpload, fullId, metadata, fileExt, fileName, fileType, url, clonedRequest, returnLink); // 使用 fileToUpload
-            } else if (channelList[i] === 'S3') {
-                res = await uploadFileToS3(env, fileToUpload, fullId, metadata, returnLink, url); // 使用 fileToUpload
+            if (channel === 'CloudflareR2') {
+                retryResponse = await uploadFileToCloudflareR2(env, fileToUpload, fullId, metadata, returnLink, url);
+            } else if (channel === 'TelegramNew') {
+                retryResponse = await uploadFileToTelegram(env, fileToUpload, fullId, metadata, fileExt, fileName, fileType, url, clonedRequest, returnLink);
+            } else if (channel === 'S3') {
+                retryResponse = await uploadFileToS3(env, fileToUpload, fullId, metadata, returnLink, url);
             }
-        } catch (retryError) {
-             // 捕获重试过程中的异常
-             errMessages[channelList[i]] = `Error: ${channelList[i]} - ${retryError.message}`;
-             continue; // 继续尝试下一个渠道
-        }
 
-
-        if (res && res.status === 200) { // 检查 res 是否存在且成功
-                return res;
+            // 检查重试是否成功
+            if (retryResponse && retryResponse.status === 200) {
+                console.log(`Retry successful with channel: ${channel}`); // 添加日志
+                return retryResponse; // 成功，返回结果
             } else {
-                // 添加检查以确保 res 存在
-                let errorText = 'Upload failed or caught error';
-                if (res) {
+                // 重试失败，记录错误
+                let errorText = `Retry failed with status ${retryResponse?.status || 'unknown'}`;
+                if (retryResponse) {
                     try {
-                        errorText = await res.text();
+                        // 尝试读取响应体，但要处理可能的错误
+                        const bodyText = await retryResponse.text();
+                        errorText += `: ${bodyText}`;
                     } catch (e) {
-
-                        // Handle cases where reading the response body fails
-                        errorText = `Failed to read response text: ${e.message}`;
+                        errorText += ` (Failed to read response body: ${e.message})`;
                     }
                 }
-                errMessages[channelList[i]] = 'Error: ' + channelList[i] + ': ' + errorText; // Added colon for clarity
+                attemptError = errorText;
             }
-        } // Closes the for loop
+        } catch (retryError) {
+             // 捕获重试过程中的代码执行异常
+             console.error(`Exception during retry with ${channel}:`, retryError); // 添加详细错误日志
+             attemptError = `Exception during retry: ${retryError.message}`;
+        }
 
-    return new Response(JSON.stringify(errMessages), { status: 500 });
+        // 记录本次尝试的错误
+        if (attemptError) {
+            allErrors[channel] = attemptError;
+            console.warn(`Retry attempt failed for channel ${channel}: ${attemptError}`); // 添加警告日志
+        }
+    }
+
+    // 所有重试均失败
+    console.error("All upload attempts failed. Errors:", allErrors); // 记录最终错误摘要
+    const finalErrorMessage = "All upload attempts failed. See Worker logs for details."; // 返回给客户端的通用错误
+    // 返回包含详细错误信息的 JSON 对象
+    return new Response(JSON.stringify({ error: finalErrorMessage, details: allErrors }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+    });
 }
 
 // 上传到Cloudflare R2
